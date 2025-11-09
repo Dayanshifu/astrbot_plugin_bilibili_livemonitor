@@ -1,0 +1,5 @@
+name: easylive # 这是你的插件的唯一识别名。
+desc: bilibili直播间推送 # 插件简短描述
+version: v1.1 # 插件版本号。格式：v1.1.1 或者 v1.1
+author: Dayanshifu # 作者
+repo: https://github.com/Dayanshifu/astrbot_plugin_bilibili_livereminder # 插件的仓库地址
