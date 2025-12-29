@@ -6,9 +6,10 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 from astrbot.api import AstrBotConfig
-import asyncio,os,requests
+import os
 
-from astrbot.core.message.message_event_result import MessageChain
+# 移除重复的import，统一使用aiohttp做异步网络请求
+
 @register(
     "astrbot_plugin_bilibili_livemonitor", 
     "Dayanshifu", 
@@ -28,7 +29,7 @@ class BilibiliLiveMonitor(Star):
             self.room_ids.append((str(ids_list[i]), str(names_list[i])))
         
         self.target_groups = [str(g) for g in config.get('groups', [])]
-        self.groups = []
+        self.groups = []  # 存储有效的消息发送源，去重后存储
         self.check_interval = config.get("time", 60)
         
         self.room_status = {
@@ -36,7 +37,8 @@ class BilibiliLiveMonitor(Star):
                 "last_status": None,
                 "last_check_time": None,
                 "live_start_time": None,
-                "anchor_name": anchor_name
+                "anchor_name": anchor_name,
+                "has_sent_live_notice": False  # 新增：标记是否已发送开播通知，防止重复
             } for room_id, anchor_name in self.room_ids
         }
         
@@ -106,6 +108,27 @@ class BilibiliLiveMonitor(Star):
             logger.error(f"检查直播间{room_id}状态失败: {str(e)}")
         return None
 
+    # 新增：异步下载封面图片，替换同步requests
+    async def download_cover_async(self, cover_url, room_id):
+        if not cover_url:
+            return None
+        save_dir = "covers"
+        new_name = f"{room_id}.jpg"
+        os.makedirs(save_dir, exist_ok=True)
+        save_path = os.path.join(save_dir, new_name)
+        
+        try:
+            if not self.session or self.session.closed:
+                await self.create_session()
+            async with self.session.get(cover_url, timeout=15) as resp:
+                resp.raise_for_status()
+                with open(save_path, 'wb') as f:
+                    f.write(await resp.read())
+            return save_path
+        except Exception as e:
+            logger.error(f"异步下载直播间{room_id}封面失败: {str(e)}")
+            return None
+
     async def monitor_task(self):
         while self.running:
             try:
@@ -116,66 +139,78 @@ class BilibiliLiveMonitor(Star):
                     
                     current_status = status_data['live_status']
                     last_status = self.room_status[room_id]["last_status"]
+                    has_sent_notice = self.room_status[room_id]["has_sent_live_notice"]
                     
                     if last_status is None:
                         self.room_status[room_id]["last_status"] = current_status
                         if current_status == 1:
                             try:
-                                live_time = status_data['live_time']
-                                self.room_status[room_id]["live_start_time"] = datetime.fromtimestamp(live_time)
-                            except (ValueError, TypeError):
+                                # 修复：live_time是字符串，使用strptime解析
+                                live_time_str = status_data['live_time']
+                                self.room_status[room_id]["live_start_time"] = datetime.strptime(live_time_str, "%Y-%m-%d %H:%M:%S")
+                            except (ValueError, TypeError) as e:
+                                logger.warning(f"解析直播间{room_id}开播时间失败，使用当前时间替代: {e}")
                                 self.room_status[room_id]["live_start_time"] = datetime.now()
+                            # 初始化时标记为已发送，防止首次检测到开播重复发送
+                            self.room_status[room_id]["has_sent_live_notice"] = True
+                        else:
+                            self.room_status[room_id]["has_sent_live_notice"] = False
                         continue
                     
+                    # 状态变更时处理
                     if current_status != last_status:
                         self.room_status[room_id]["last_status"] = current_status
                         
+                        # 开播状态：1
                         if current_status == 1:
-                            room_info = status_data['room_info'] or {}
-                            anchor_name = status_data['anchor_name']
-                            room_title = room_info.get('title', '无标题')
-                            room_url = f"https://live.bilibili.com/{room_id}"
-                            cover_url = room_info.get('user_cover', '')
-                            '''
-                            message = [
-                                Comp.Plain(f"{anchor_name} 开播了喵！\n{room_title}\n传送门: {room_url}")
-                            ]
-                            if cover_url:
-                                message.append(Comp.Image.fromURL(cover_url))'''
-                            save_dir = "covers"
-                            new_name = f"{room_id}.jpg"
-                            os.makedirs(save_dir, exist_ok=True)
-                            response = requests.get(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-                            response.raise_for_status()
-                            save_path = os.path.join(save_dir, new_name)
-                            with open(save_path, 'wb') as f:
-                                f.write(response.content)
-                            message=MessageChain().message(f"{anchor_name} 开播了喵！\n{room_title}\n传送门: {room_url}").file_image(save_path)
-                            for group_id in self.groups:
-                                await self.context.send_message(
-                                    group_id,message
-                                )
-                                logger.info(f"已向群{group_id}发送通知")
-                            logger.info(f"直播间{room_id}({anchor_name})开播")
+                            # 新增：未发送过通知才执行发送逻辑
+                            if not has_sent_notice:
+                                room_info = status_data['room_info'] or {}
+                                anchor_name = status_data['anchor_name']
+                                room_title = room_info.get('title', '无标题')
+                                room_url = f"https://live.bilibili.com/{room_id}"
+                                cover_url = room_info.get('user_cover', '')
+                                
+                                # 异步下载封面，替换同步requests
+                                save_path = await self.download_cover_async(cover_url, room_id)
+                                
+                                # 构建消息
+                                message = MessageChain().message(f"{anchor_name} 开播了喵！\n{room_title}\n传送门: {room_url}")
+                                if save_path and os.path.exists(save_path):
+                                    message.file_image(save_path)
+                                
+                                # 遍历去重后的groups发送消息
+                                for group_id in list(set(self.groups)):  # 双重保险：遍历前去重
+                                    try:
+                                        await self.context.send_message(group_id, message)
+                                        logger.info(f"已向群{group_id}发送{anchor_name}开播通知")
+                                    except Exception as e:
+                                        logger.error(f"向群{group_id}发送开播通知失败: {e}")
+                                
+                                # 发送后标记为已发送，防止重复
+                                self.room_status[room_id]["has_sent_live_notice"] = True
+                                logger.info(f"直播间{room_id}({anchor_name})开播，已发送通知")
+                        # 下播状态：非1
                         else:
+                            # 下播时重置开播通知标记
+                            self.room_status[room_id]["has_sent_live_notice"] = False
                             self.room_status[room_id]["live_start_time"] = None
                             anchor_name = self.room_status[room_id]["anchor_name"]
-                            #self.notifications.append([
-                            #    Comp.Plain(f"{anchor_name}的直播已结束喵。")
-                            #])
-                            message=MessageChain().message(f"{anchor_name}的直播已结束喵。")
-                            for group_id in self.groups:
-                                await self.context.send_message(
-                                    group_id,message
-                                )
-                                logger.info(f"已向群{group_id}发送通知")
+                            
+                            message = MessageChain().message(f"{anchor_name}的直播已结束喵。")
+                            # 遍历去重后的groups发送消息
+                            for group_id in list(set(self.groups)):
+                                try:
+                                    await self.context.send_message(group_id, message)
+                                    logger.info(f"已向群{group_id}发送{anchor_name}下播通知")
+                                except Exception as e:
+                                    logger.error(f"向群{group_id}发送下播通知失败: {e}")
                             logger.info(f"直播间{room_id}({anchor_name})已下播")
             
             except Exception as e:
                 logger.error(f"监控任务出错: {str(e)}")
             
             await asyncio.sleep(self.check_interval)
-
 
     async def get_live_info(self, room_id=None):
         room_id_list = [rid for rid, _ in self.room_ids]
@@ -239,9 +274,9 @@ class BilibiliLiveMonitor(Star):
     async def liveinfo_command(self, event: AstrMessageEvent, room_id: str = None):
         info = await self.get_live_info(room_id)
         yield event.plain_result(info)
+
     @filter.command("livedebug")
     async def livedebug_command(self, event: AstrMessageEvent, room_id: str = None):
-        
         yield event.plain_result(1)
         for room_id, _ in self.room_ids:
             status_data = await self.check_live_status(room_id)
@@ -250,43 +285,41 @@ class BilibiliLiveMonitor(Star):
             
             current_status = status_data['live_status']
             last_status = self.room_status[room_id]["last_status"]
+            has_sent_notice = self.room_status[room_id]["has_sent_live_notice"]
             
             if last_status is None:
                 self.room_status[room_id]["last_status"] = current_status
                 if current_status == 1:
                     try:
-                        live_time = status_data['live_time']
-                        self.room_status[room_id]["live_start_time"] = datetime.fromtimestamp(live_time)
+                        live_time_str = status_data['live_time']
+                        self.room_status[room_id]["live_start_time"] = datetime.strptime(live_time_str, "%Y-%m-%d %H:%M:%S")
                     except (ValueError, TypeError):
                         self.room_status[room_id]["live_start_time"] = datetime.now()
+                    self.room_status[room_id]["has_sent_live_notice"] = True
                 continue
+            
             self.room_status[room_id]["last_status"] = current_status
-            room_info = status_data['room_info'] or {}
-            anchor_name = status_data['anchor_name']
-            room_title = room_info.get('title', '无标题')
-            room_url = f"https://live.bilibili.com/{room_id}"
-            cover_url = room_info.get('user_cover', '')
-            '''
-            message = [
-                Comp.Plain(f"{anchor_name} 开播了喵！\n{room_title}\n传送门: {room_url}")
-            ]
-            if cover_url:
-                message.append(Comp.Image.fromURL(cover_url))'''
-            save_dir = "covers"
-            new_name = f"{room_id}.jpg"
-            os.makedirs(save_dir, exist_ok=True)
-            response = requests.get(cover_url, headers={'User-Agent': 'Mozilla/5.0'})
-            response.raise_for_status()
-            save_path = os.path.join(save_dir, new_name)
-            with open(save_path, 'wb') as f:
-                f.write(response.content)
-            message=MessageChain().message(f"{anchor_name} 开播了喵！\n{room_title}\n传送门: {room_url}").file_image(save_path)
-            for group_id in self.groups:
-                await self.context.send_message(
-                    group_id,message
-                )
-                logger.info(f"已向群{group_id}发送通知")
-            logger.info(f"直播间{room_id}({anchor_name})开播")
+            if current_status == 1 and not has_sent_notice:
+                room_info = status_data['room_info'] or {}
+                anchor_name = status_data['anchor_name']
+                room_title = room_info.get('title', '无标题')
+                room_url = f"https://live.bilibili.com/{room_id}"
+                cover_url = room_info.get('user_cover', '')
+                
+                save_path = await self.download_cover_async(cover_url, room_id)
+                message = MessageChain().message(f"{anchor_name} 开播了喵！\n{room_title}\n传送门: {room_url}")
+                if save_path and os.path.exists(save_path):
+                    message.file_image(save_path)
+                
+                for group_id in list(set(self.groups)):
+                    try:
+                        await self.context.send_message(group_id, message)
+                        logger.info(f"调试模式：已向群{group_id}发送通知")
+                    except Exception as e:
+                        logger.error(f"调试模式：向群{group_id}发送通知失败: {e}")
+                
+                self.room_status[room_id]["has_sent_live_notice"] = True
+                logger.info(f"调试模式：直播间{room_id}({anchor_name})开播通知已发送")
         
         await asyncio.sleep(self.check_interval)
 
@@ -297,11 +330,11 @@ class BilibiliLiveMonitor(Star):
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE)
     async def on_group_message(self, event: AstrMessageEvent):
         group_id = event.get_group_id()
-        if  str(group_id) in self.target_groups:
-            if str(group_id) not in self.groups:
-                self.groups.append(event.unified_msg_origin)
-
-            
+        msg_origin = event.unified_msg_origin
+        # 修复核心：添加存在性判断，避免重复添加
+        if str(group_id) in self.target_groups and msg_origin not in self.groups:
+            self.groups.append(msg_origin)
+            logger.info(f"群组{group_id}已加入有效发送列表")
 
     async def terminate(self):
         self.running = False
