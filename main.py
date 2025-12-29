@@ -298,7 +298,8 @@ class BilibiliLiveMonitor(Star):
     async def on_group_message(self, event: AstrMessageEvent):
         group_id = event.get_group_id()
         if  str(group_id) in self.target_groups:
-            self.groups.append(event.unified_msg_origin)
+            if str(group_id) not in self.groups:
+                self.groups.append(event.unified_msg_origin)
 
             
 
