@@ -14,7 +14,7 @@ import os
     "astrbot_plugin_bilibili_livemonitor", 
     "Dayanshifu", 
     "bilibili开播下播提醒", 
-    "1.1.3",
+    "1.1.4",
     "https://github.com/Dayanshifu/astrbot_plugin_bilibili_livemonitor"
 )
 class BilibiliLiveMonitor(Star):
@@ -29,7 +29,8 @@ class BilibiliLiveMonitor(Star):
             self.room_ids.append((str(ids_list[i]), str(names_list[i])))
         
         self.target_groups = [str(g) for g in config.get('groups', [])]
-        self.groups = []  # 存储有效的消息发送源，去重后存储
+        # 按群号保存一个可用的 session，避免同群不同成员发言造成重复推送
+        self.group_sessions = {}
         self.check_interval = config.get("time", 60)
         
         self.room_status = {
@@ -181,11 +182,11 @@ class BilibiliLiveMonitor(Star):
                                 if save_path and os.path.exists(save_path):
                                     message.file_image(save_path)
                                 
-                                # 遍历去重后的groups发送消息
-                                for group_id in list(set(self.groups)):  # 双重保险：遍历前去重
+                                # 每个群仅保留一个 session，避免同群重复推送
+                                for group_id, session in self.group_sessions.items():
                                     try:
-                                        await self.context.send_message(group_id, message)
-                                        logger.info(f"已向群{group_id}发送{anchor_name}开播通知")
+                                        await self.context.send_message(session, message)
+                                        logger.info(f"已向群{group_id}发送{anchor_name}开播通知，session={session}")
                                     except Exception as e:
                                         logger.error(f"向群{group_id}发送开播通知失败: {e}")
                                 
@@ -200,11 +201,11 @@ class BilibiliLiveMonitor(Star):
                             anchor_name = self.room_status[room_id]["anchor_name"]
                             
                             message = MessageChain().message(f"{anchor_name}的直播已结束喵。")
-                            # 遍历去重后的groups发送消息
-                            for group_id in list(set(self.groups)):
+                            # 每个群仅保留一个 session，避免同群重复推送
+                            for group_id, session in self.group_sessions.items():
                                 try:
-                                    await self.context.send_message(group_id, message)
-                                    logger.info(f"已向群{group_id}发送{anchor_name}下播通知")
+                                    await self.context.send_message(session, message)
+                                    logger.info(f"已向群{group_id}发送{anchor_name}下播通知，session={session}")
                                 except Exception as e:
                                     logger.error(f"向群{group_id}发送下播通知失败: {e}")
                             logger.info(f"直播间{room_id}({anchor_name})已下播")
@@ -281,10 +282,10 @@ class BilibiliLiveMonitor(Star):
     async def on_group_message(self, event: AstrMessageEvent):
         group_id = event.get_group_id()
         msg_origin = event.unified_msg_origin
-        # 修复核心：添加存在性判断，避免重复添加
-        if str(group_id) in self.target_groups and msg_origin not in self.groups:
-            self.groups.append(msg_origin)
-            logger.info(f"群组{group_id}已加入有效发送列表")
+        if str(group_id) in self.target_groups:
+            if str(group_id) not in self.group_sessions:
+                self.group_sessions[str(group_id)] = msg_origin
+                logger.info(f"群组{group_id}已加入有效发送列表: {msg_origin}")
 
     async def init_and_monitor(self):
         await self.create_session()
